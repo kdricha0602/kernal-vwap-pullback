@@ -1,0 +1,116 @@
+//@version=6
+// ============================================================================
+// Kernal VWAP v6 — intraday edition (2026-10-13)
+// ----------------------------------------------------------------------------
+// WHAT WAS TESTED: EOD-flat battery 2026-10-13 (REPORT.md §9, kvwapt_tdi_battery).
+// v5 logic + forced 15:10 CT flat, LONGS ONLY, NQ 5m:
+//   PF 1.77 | 50.0% win | +$3,085 | maxDD ~$1,860 | avg hold 7.3h
+//   Walk-forward holds both halves. No overnight holds, ever.
+//
+// WHAT CHANGED FROM v5: v5's selective exit (full opposite signal) let
+// winners ride for days (avg 22.5h, max 6.4d, 53% overnight). v6 forces
+// flat at 15:10 CT and requires a fresh cross after the flat — no
+// morning re-entry on stale conditions (tested: adds nothing).
+//
+// LOGIC: EMA9/21 cross + ATR-normalized slope > 0.15 + strict VWAP side
+// (bar low > VWAP). Exit on full opposite signal OR 15:10 CT flat,
+// whichever comes first. VWAP anchored 17:00 Chicago.
+// Confirmed bars only. No repaint. Intraday only.
+// ============================================================================
+strategy("Kernal VWAP v6 [KK]", shorttitle="KVWAP6", overlay=true,
+     default_qty_type=strategy.percent_of_equity, default_qty_value=100,
+     commission_type=strategy.commission.cash_per_contract,
+     commission_value=1.41, slippage=1)
+
+// === Inputs (validated defaults — all adjustable) ===
+fastLen     = input.int(9, "Fast EMA", minval=2)
+slowLen     = input.int(21, "Slow EMA", minval=3)
+slopeThresh = input.float(0.15, "Min EMA9 slope (ATR-normalized)", step=0.05)
+useVwap     = input.bool(true, "Use VWAP filter")
+vwapAnchor  = input.string("17:00", "VWAP anchor", options=["00:00", "08:30", "17:00"])
+atrLen      = input.int(5, "ATR length", minval=1)
+flatHour    = input.int(15, "Flat hour (CT)", minval=0, maxval=23)
+flatMin     = input.int(10, "Flat minute (CT)", minval=0, maxval=59)
+useShorts   = input.bool(false, "Enable shorts (UNVALIDATED — shorts drag PF below bar)")
+
+// === Calculations ===
+emaFast = ta.ema(close, fastLen)
+emaSlow = ta.ema(close, slowLen)
+
+anchorMs  = vwapAnchor == "00:00" ? 0 : vwapAnchor == "08:30" ? 30600000 : 61200000
+tShift    = time - anchorMs
+anchorKey = year(tShift, "America/Chicago") * 10000 + month(tShift, "America/Chicago") * 100 + dayofmonth(tShift, "America/Chicago")
+newVwapDay = ta.change(anchorKey) != 0
+var float cumPV = 0.0
+var float cumV  = 0.0
+if newVwapDay
+    cumPV := hlc3 * volume
+    cumV  := volume
+else
+    cumPV := nz(cumPV[1]) + hlc3 * volume
+    cumV  := nz(cumV[1]) + volume
+vwap   = cumV > 0 ? cumPV / cumV : na
+atrVal = ta.atr(atrLen)
+
+slopeUp   = (emaFast - emaFast[3]) / atrVal > slopeThresh
+slopeDn   = (emaFast - emaFast[3]) / atrVal < -slopeThresh
+aboveVwap = low  > vwap
+belowVwap = high < vwap
+vwapLongOk  = not useVwap or aboveVwap
+vwapShortOk = not useVwap or belowVwap
+crossUp = ta.crossover(emaFast, emaSlow)
+crossDn = ta.crossunder(emaFast, emaSlow)
+
+// === Session clock (Chicago) ===
+ctHour = hour(time, "America/Chicago")
+ctMin  = minute(time, "America/Chicago")
+atFlat = (ctHour > flatHour) or (ctHour == flatHour and ctMin >= flatMin)
+canTrade = not atFlat
+
+// === Signals (confirmed bars only — no repaint) ===
+sigLong  = crossUp and slopeUp and vwapLongOk and canTrade and barstate.isconfirmed
+sigShort = useShorts and crossDn and slopeDn and vwapShortOk and canTrade and barstate.isconfirmed
+exitSig  = crossDn and slopeDn and vwapShortOk and barstate.isconfirmed
+exitLong = exitSig and strategy.position_size > 0
+eodFlat  = atFlat and strategy.position_size > 0 and barstate.isconfirmed
+
+// === Entries / exits ===
+if sigLong
+    strategy.entry("KVWAP_L", strategy.long)
+    alert("BUY signal — Kernal VWAP v6 long", alert.freq_once_per_bar_close)
+if exitLong
+    strategy.close("KVWAP_L", comment="X")
+    alert("EXIT signal — close Kernal VWAP v6 long", alert.freq_once_per_bar_close)
+if eodFlat
+    strategy.close("KVWAP_L", comment="EOD")
+    alert("EOD FLAT — close Kernal VWAP v6 long", alert.freq_once_per_bar_close)
+if sigShort
+    strategy.entry("KVWAP_S", strategy.short)
+    alert("SHORT signal — Kernal VWAP v6 short (unvalidated)", alert.freq_once_per_bar_close)
+
+// === Visuals ===
+plot(emaFast, "EMA9",  color.yellow, 2)
+plot(emaSlow, "EMA21", color.orange, 2)
+plot(vwap,    "VWAP",  color.aqua,   2)
+plotshape(sigLong,  "Buy",  shape.triangleup,   location.belowbar, color.green, size=size.normal)
+plotshape(exitLong, "Exit", shape.xcross,       location.abovebar, color.yellow, size=size.small)
+plotshape(eodFlat,  "EOD",  shape.square,       location.abovebar, color.orange, size=size.small)
+plotshape(sigShort, "Sell", shape.triangledown, location.abovebar, color.red,   size=size.normal)
+
+// === Dashboard ===
+var table t = table.new(position.top_right, 2, 7, border_width=1)
+if barstate.islast
+    table.cell(t, 0, 0, "KVWAP v6",      text_color=color.yellow, text_size=size.small)
+    table.cell(t, 1, 0, "INTRADAY",      text_color=color.orange, text_size=size.small)
+    table.cell(t, 0, 1, "EMA9",          text_color=color.white,  text_size=size.small)
+    table.cell(t, 1, 1, str.tostring(emaFast, format.mintick), text_color=color.white, text_size=size.small)
+    table.cell(t, 0, 2, "VWAP",          text_color=color.white,  text_size=size.small)
+    table.cell(t, 1, 2, str.tostring(vwap, format.mintick),    text_color=color.white, text_size=size.small)
+    table.cell(t, 0, 3, "Slope",         text_color=color.white,  text_size=size.small)
+    table.cell(t, 1, 3, str.tostring((emaFast - emaFast[3]) / atrVal, "#.##"), text_color=color.white, text_size=size.small)
+    table.cell(t, 0, 4, "Buy now",       text_color=color.white,  text_size=size.small)
+    table.cell(t, 1, 4, str.tostring(sigLong),  text_color=sigLong  ? color.green : color.gray, text_size=size.small)
+    table.cell(t, 0, 5, "Exit now",      text_color=color.white,  text_size=size.small)
+    table.cell(t, 1, 5, str.tostring(exitLong), text_color=exitLong ? color.yellow : color.gray, text_size=size.small)
+    table.cell(t, 0, 6, "EOD flat",      text_color=color.white,  text_size=size.small)
+    table.cell(t, 1, 6, str.tostring(atFlat),   text_color=atFlat ? color.orange : color.gray, text_size=size.small)

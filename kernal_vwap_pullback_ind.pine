@@ -1,0 +1,119 @@
+//@version=5
+// ============================================================================
+// Kernal VWAP Pullback — INDICATOR edition
+// EMA9/EMA21 pullback entries + VWAP anchor + ATR(5) chop filter.
+// Diamonds = pullback setups | Triangles = confirmed entries (no repaint)
+// Built from the proven v3 foundation (no strategy.* calls — pure indicator).
+// ============================================================================
+indicator("Kernal VWAP Pullback", shorttitle="KVWAP", overlay=true)
+
+// === Inputs (all adjustable, shipped at best defaults) ===
+fastLen     = input.int(9, "Fast EMA", minval=1)
+slowLen     = input.int(21, "Slow EMA", minval=2)
+slopeThresh = input.float(0.15, "Min EMA9 slope (ATR-normalized)", step=0.05)
+useVwap     = input.bool(true, "Use VWAP side filter")
+vwapAnchor  = input.string("17:00", "VWAP anchor (Chicago)", options=["00:00", "08:30", "17:00"])
+useChop     = input.bool(true, "Use ATR chop filter (stand down in chop)")
+showZone    = input.bool(true, "Shade EMA9/21 pullback zone")
+showTable   = input.bool(true, "Show status table")
+
+// === Core calcs (v3-proven) ===
+emaFast = ta.ema(close, fastLen)
+emaSlow = ta.ema(close, slowLen)
+atrVal  = ta.atr(5)
+
+anchorMs  = vwapAnchor == "00:00" ? 0 : vwapAnchor == "08:30" ? 30600000 : 61200000
+tShift    = time - anchorMs
+anchorKey = year(tShift, "America/Chicago") * 10000 + month(tShift, "America/Chicago") * 100 + dayofmonth(tShift, "America/Chicago")
+newVwapDay = ta.change(anchorKey) != 0
+
+var float cumPV = 0.0
+var float cumV  = 0.0
+if newVwapDay
+    cumPV := hlc3 * volume
+    cumV  := volume
+else
+    cumPV := nz(cumPV[1]) + hlc3 * volume
+    cumV  := nz(cumV[1])  + volume
+vwap = cumV > 0 ? cumPV / cumV : na
+
+// === ATR chop filter: falling ATR or ATR below session average = chop ===
+var float atrCum = 0.0
+var int   atrN   = 0
+if newVwapDay
+    atrCum := atrVal
+    atrN   := 1
+else
+    atrCum := nz(atrCum[1]) + atrVal
+    atrN   := nz(atrN[1]) + 1
+atrAvg     = atrN > 0 ? atrCum / atrN : na
+atrFalling = atrVal < atrVal[3]
+chopMode   = useChop and (atrFalling or atrVal < atrAvg * 0.9)
+
+// === Trend state ===
+slopeUp = (emaFast - emaFast[3]) / atrVal >  slopeThresh
+slopeDn = (emaFast - emaFast[3]) / atrVal < -slopeThresh
+aboveVwap = low  > vwap
+belowVwap = high < vwap
+bullAligned = emaFast > emaSlow and slopeUp and (not useVwap or aboveVwap)
+bearAligned = emaFast < emaSlow and slopeDn and (not useVwap or belowVwap)
+
+// === Pullback state machines ===
+// Long: candle taps down into the EMA9/21 zone (low <= EMA9, holds >= EMA21)
+touchL = bullAligned and low  <= emaFast and low  >= emaSlow
+// Short: candle rallies up into the zone (high >= EMA9, holds <= EMA21)
+touchS = bearAligned and high >= emaFast and high <= emaSlow
+
+var bool inPbL = false
+var bool inPbS = false
+
+// Entry = first confirmed candle closing back OUT of the zone in trend direction
+longEntry  = barstate.isconfirmed and bullAligned and close > open and close > emaFast and (inPbL or touchL) and not chopMode
+shortEntry = barstate.isconfirmed and bearAligned and close < open and close < emaFast and (inPbS or touchS) and not chopMode
+
+// Advance state: stay in pullback while alignment holds and slow line not sliced
+inPbL := touchL or (inPbL and bullAligned and close >= emaSlow and not longEntry)
+inPbS := touchS or (inPbS and bearAligned and close <= emaSlow and not shortEntry)
+
+// === Plots ===
+pFast = plot(emaFast, "EMA9", color.yellow, 2)
+pSlow = plot(emaSlow, "EMA21", color.orange, 2)
+plot(vwap, "VWAP", color.aqua, 2)
+fill(pFast, pSlow, color=showZone ? (bullAligned ? color.new(color.green, 85) : bearAligned ? color.new(color.red, 85) : na) : na, title="Pullback zone")
+
+plotshape(touchL and barstate.isconfirmed, "Long setup",  shape.diamond,     location.belowbar, color.new(color.lime, 0),    size=size.small)
+plotshape(touchS and barstate.isconfirmed, "Short setup", shape.diamond,     location.abovebar, color.new(color.fuchsia, 0), size=size.small)
+plotshape(longEntry,  "LONG",  shape.triangleup,   location.belowbar, color.green, size=size.normal)
+plotshape(shortEntry, "SHORT", shape.triangledown, location.abovebar, color.red,   size=size.normal)
+
+// === Alerts (for TradingView alert dialog) ===
+alertcondition(longEntry,  "KVWAP Long",  "Kernal VWAP Pullback LONG {{ticker}} {{interval}}")
+alertcondition(shortEntry, "KVWAP Short", "Kernal VWAP Pullback SHORT {{ticker}} {{interval}}")
+
+// === Status table ===
+var table t = table.new(position.top_right, 2, 9, border_width=1)
+if showTable and barstate.islast
+    trendTxt = bullAligned ? "BULL" : bearAligned ? "BEAR" : "NONE"
+    trendCol = bullAligned ? color.green : bearAligned ? color.red : color.gray
+    atrTxt = chopMode ? "CHOP - STAND DOWN" : atrFalling ? "FALLING" : "EXPANDING"
+    atrCol = chopMode ? color.red : atrFalling ? color.orange : color.green
+    pbTxt = inPbL ? "LONG pullback live" : inPbS ? "SHORT pullback live" : "—"
+    sigTxt = longEntry ? "LONG ENTRY" : shortEntry ? "SHORT ENTRY" : "—"
+    table.cell(t, 0, 0, "EMA9", text_color=color.white)
+    table.cell(t, 1, 0, str.tostring(emaFast, format.mintick), text_color=color.yellow)
+    table.cell(t, 0, 1, "EMA21", text_color=color.white)
+    table.cell(t, 1, 1, str.tostring(emaSlow, format.mintick), text_color=color.orange)
+    table.cell(t, 0, 2, "VWAP", text_color=color.white)
+    table.cell(t, 1, 2, str.tostring(vwap, format.mintick), text_color=color.aqua)
+    table.cell(t, 0, 3, "ATR(5)", text_color=color.white)
+    table.cell(t, 1, 3, atrTxt, text_color=atrCol)
+    table.cell(t, 0, 4, "Trend", text_color=color.white)
+    table.cell(t, 1, 4, trendTxt, text_color=trendCol)
+    table.cell(t, 0, 5, "Pullback", text_color=color.white)
+    table.cell(t, 1, 5, pbTxt, text_color=color.white)
+    table.cell(t, 0, 6, "Signal", text_color=color.white)
+    table.cell(t, 1, 6, sigTxt, text_color=color.white)
+    table.cell(t, 0, 7, "VWAP side", text_color=color.white)
+    table.cell(t, 1, 7, aboveVwap ? "ABOVE (longs ok)" : belowVwap ? "BELOW (shorts ok)" : "INSIDE (no entries)", text_color=color.white)
+    table.cell(t, 0, 8, "HEARTBEAT", text_color=color.yellow)
+    table.cell(t, 1, 8, "KVWAP-IND RUNNING", text_color=color.yellow)
